@@ -6,7 +6,14 @@ using UnityEngine.Sprites;
 
 namespace RotateRings
 {
-    public enum Ring2DPhysicsMode { None, TriggerDetection, BlockRotation }
+    public enum Ring2DMovementAxis { [InspectorName("左右")] Horizontal, [InspectorName("上下")] Vertical }
+    // 保留枚举数值及字段名，以兼容已有场景的序列化设置。
+    public enum Ring2DPhysicsMode
+    {
+        None,
+        [InspectorName("无阻挡（旧 TriggerDetection）")] TriggerDetection,
+        [InspectorName("几何阻挡（旋转 / 移动）")] BlockRotation
+    }
     /// <summary>世界空间二维圆环：A 图生成平面 Mesh，B 图生成独立的连接杆/头子元素。</summary>
     [ExecuteAlways, RequireComponent(typeof(MeshFilter), typeof(MeshRenderer), typeof(SortingGroup))]
     public sealed class ProceduralRing2D : MonoBehaviour
@@ -19,7 +26,9 @@ namespace RotateRings
         public string SortingLayer = "Default";
         public int SortingOrder;
         public bool AllowDrag = true;
-        public Ring2DPhysicsMode PhysicsMode = Ring2DPhysicsMode.BlockRotation;
+        [Tooltip("直线、门形、7 形、Z 形的世界坐标移动轴。")]
+        public Ring2DMovementAxis MovementAxis = Ring2DMovementAxis.Horizontal;
+        [InspectorName("Collision Mode")] public Ring2DPhysicsMode PhysicsMode = Ring2DPhysicsMode.BlockRotation;
         public bool LockRotation;
         [Range(8, 128), Tooltip("碰撞圆周分段，与显示 Segments 独立；C 环按覆盖角缩减，门字环仅细分圆角。")]
         public int ColliderSegments = 32;
@@ -41,10 +50,23 @@ namespace RotateRings
         private static ProceduralRing2D dragged;
         private static int pickFrame = -1;
         private float lastDragAngle;
-        private float pendingRotation;
+        private Vector3 lastDragPoint;
+        private ProceduralRing2D lastLoggedObstacle;
+        private ProceduralRing2D blockedByContactOwner, contactPartner;
+        private float lastCollisionLogTime = float.NegativeInfinity;
+        private static readonly List<ProceduralRing2D> activeRings = new List<ProceduralRing2D>();
+        private readonly List<Ring2DCollisionShape> localShapes = new List<Ring2DCollisionShape>();
+        private readonly List<Ring2DCollisionShape> worldShapes = new List<Ring2DCollisionShape>();
+        private readonly List<ProceduralRing2D> obstacles = new List<ProceduralRing2D>();
 
         public IReadOnlyList<Ring2DConnectionView> ConnectionViews { get { return views; } }
         public Mesh SavedMesh { get { return savedMesh; } }
+        public Vector3 LastCollisionPoint { get; private set; }
+        public event Action<ProceduralRing2D, Vector3> CollisionBlocked;
+        public bool DragsByMovement { get { return Settings.Shape == Ring2DShape.Straight || Settings.Shape == Ring2DShape.Gate ||
+            Settings.Shape == Ring2DShape.Seven || Settings.Shape == Ring2DShape.ZShape; } }
+        private bool SharesMovementAxis(ProceduralRing2D other)
+        { return DragsByMovement && other.DragsByMovement && MovementAxis == other.MovementAxis; }
         /// <summary>只在形状和 A 图 UV 仍匹配时复用资源，避免显示旧形状而碰撞体已变成新形状。</summary>
         public bool UsesSavedMesh
         {
@@ -67,7 +89,7 @@ namespace RotateRings
 
         private double CapFraction()
         { return BodySprite.border.x > 0 ? BodySprite.border.x / BodySprite.rect.width : BodySprite.rect.height / 2 / BodySprite.rect.width; }
-        private void OnEnable() { dirty = true; }
+        private void OnEnable() { activeRings.Add(this); DisablePhysics(); dirty = true; }
         private void OnValidate() { dirty = true; }
 
         /// <summary>只在参数变化时更新网格/子对象。旋转只动父级 Transform，所有子元素一起跟随。</summary>
@@ -78,38 +100,160 @@ namespace RotateRings
             if (Input.GetMouseButtonDown(0) && pickFrame != Time.frameCount)
             {
                 pickFrame = Time.frameCount; dragged = null;
-                foreach (var ring in FindObjectsOfType<ProceduralRing2D>())
-                    if (ring.AllowDrag && !ring.LockRotation && ring.HitPointer() && (dragged == null || ring.SortingOrder > dragged.SortingOrder ||
+                foreach (var ring in activeRings)
+                    if (ring.AllowDrag && (ring.DragsByMovement || !ring.LockRotation) && ring.HitPointer() && (dragged == null || ring.SortingOrder > dragged.SortingOrder ||
                         (ring.SortingOrder == dragged.SortingOrder && ring.GetInstanceID() > dragged.GetInstanceID()))) dragged = ring;
-                if (dragged != null) dragged.lastDragAngle = dragged.PointerAngle();
+                if (dragged != null) { dragged.lastDragAngle = dragged.PointerAngle(); dragged.lastDragPoint = dragged.PointerWorldPoint(); }
             }
             if (dragged == this && Input.GetMouseButton(0))
             {
-                float angle = PointerAngle(); RequestRotation(Mathf.DeltaAngle(lastDragAngle, angle)); lastDragAngle = angle;
+                if (DragsByMovement)
+                {
+                    Vector3 point = PointerWorldPoint(); RequestMovement(point - lastDragPoint); lastDragPoint = point;
+                }
+                else
+                {
+                    float angle = PointerAngle(); RequestRotation(Mathf.DeltaAngle(lastDragAngle, angle)); lastDragAngle = angle;
+                }
             }
             if (Input.GetMouseButtonUp(0)) dragged = null;
         }
 
-        /// <summary>实体模式只提交旋转请求，不直接修改 Transform；碰撞可能使实际角度小于请求。</summary>
+        /// <summary>直接执行几何受限旋转；遇到障碍立即丢弃剩余请求。</summary>
         public void RequestRotation(float degrees)
         {
             if (LockRotation || float.IsNaN(degrees) || float.IsInfinity(degrees)) return;
-            if (PhysicsMode == Ring2DPhysicsMode.BlockRotation) pendingRotation += Mathf.Clamp(degrees, -180, 180);
-            else transform.Rotate(0, 0, degrees);
+            MoveGeometry(Mathf.Clamp(degrees, -180, 180), Vector3.zero);
         }
 
-        private void FixedUpdate() { ApplyPhysicsRotation(); }
-
-        /// <summary>在固定物理步执行动态刚体旋转，中心被约束。丢弃受阻的累计量，反向拖动可立即响应。</summary>
-        public void ApplyPhysicsRotation()
+        /// <summary>世界空间位移，移动形状沿配置轴投影，并检查完整移动路径。</summary>
+        public void RequestMovement(Vector2 displacement)
         {
-            if (PhysicsMode != Ring2DPhysicsMode.BlockRotation || LockRotation) { pendingRotation = 0; return; }
-            var body = GetComponent<Rigidbody2D>();
-            if (body != null && body.simulated && Mathf.Abs(pendingRotation) > 0.0001f)
-                body.MoveRotation(body.rotation + Mathf.Clamp(pendingRotation, -720 * Time.fixedDeltaTime, 720 * Time.fixedDeltaTime));
-            pendingRotation = 0;
+            if (float.IsNaN(displacement.x) || float.IsInfinity(displacement.x) ||
+                float.IsNaN(displacement.y) || float.IsInfinity(displacement.y)) return;
+            if (DragsByMovement)
+                displacement = MovementAxis == Ring2DMovementAxis.Horizontal ? new Vector2(displacement.x, 0) : new Vector2(0, displacement.y);
+            MoveGeometry(0, displacement);
         }
 
+        private void MoveGeometry(float degrees, Vector3 displacement)
+        {
+            if (dirty) Rebuild();
+            if (blockedByContactOwner != null && SharesMovementAxis(blockedByContactOwner)) blockedByContactOwner = null;
+            Quaternion rotation = transform.localRotation;
+            Vector3 position = transform.position;
+            if (PhysicsMode != Ring2DPhysicsMode.BlockRotation)
+            { transform.localRotation = rotation * Quaternion.Euler(0, 0, degrees); transform.position = position + displacement; return; }
+            if (localShapes.Count == 0) return;
+            obstacles.Clear();
+            foreach (var ring in activeRings)
+            {
+                if (ring == this || ring.PhysicsMode != Ring2DPhysicsMode.BlockRotation) continue;
+                if (ring.dirty) ring.Rebuild();
+                ring.UpdateWorldShapes(ring.transform.localToWorldMatrix);
+                obstacles.Add(ring);
+            }
+            UpdateWorldShapes(transform.localToWorldMatrix);
+            double radius = 0;
+            foreach (var shape in worldShapes) foreach (var point in shape.Points)
+                radius = Math.Max(radius, Math.Sqrt((point.X-position.x)*(point.X-position.x) +
+                    (point.Y-position.y)*(point.Y-position.y)) + shape.Radius);
+            double travel = Math.Abs(degrees) * Mathf.Deg2Rad * radius + displacement.magnitude;
+            if (travel <= 1e-12) return;
+            Matrix4x4 parent = transform.parent != null ? transform.parent.localToWorldMatrix : Matrix4x4.identity;
+            Vector3 localPosition = transform.localPosition;
+            Vector3 localDisplacement = parent.inverse.MultiplyVector(displacement);
+            ProceduralRing2D hitRing = null;
+            Vector3 hitPosition = position;
+            float hitAngle = transform.eulerAngles.z;
+            int hitShape = -1, hitOtherShape = -1;
+            Vector3 hitPoint = position;
+            double latchedClearance = double.PositiveInfinity;
+            int latchedShape = -1, latchedOtherShape = -1;
+            bool blocked;
+            bool heldByContactOwner = false;
+            Func<double, double> clearanceAt = t =>
+            {
+                var matrix = parent * Matrix4x4.TRS(localPosition + localDisplacement * (float)t,
+                    rotation * Quaternion.Euler(0, 0, degrees * (float)t), transform.localScale);
+                UpdateWorldShapes(matrix);
+                double clearance = double.PositiveInfinity;
+                ProceduralRing2D closestRing = null;
+                int closestShape = -1, closestOtherShape = -1;
+                latchedClearance = double.PositiveInfinity;
+                foreach (var ring in obstacles) for (int i = 0; i < worldShapes.Count; i++) for (int j = 0; j < ring.worldShapes.Count; j++)
+                {
+                    var a = worldShapes[i]; var b = ring.worldShapes[j];
+                    // 完整圆环的环身旋转不改变轮廓；只有连接件参与主动旋转的阻挡。
+                    // 若本对象是被锁住的 B，仍需检查全部轮廓来判断与 A 的接触是否解除。
+                    if (blockedByContactOwner == null && displacement == Vector3.zero && degrees != 0 && a.RotationInvariant) continue;
+                    double boundsDistance = Ring2DCollision.BoundsDistance(a, b);
+                    if (boundsDistance > Math.Max(0, clearance) &&
+                        (ring != blockedByContactOwner || boundsDistance > Math.Max(0, latchedClearance))) continue;
+                    double distance = Ring2DCollision.Clearance(a, b);
+                    if (ring == blockedByContactOwner && distance < latchedClearance)
+                    { latchedClearance = distance; latchedShape = i; latchedOtherShape = j; }
+                    if (distance < clearance) { clearance = distance; closestRing = ring; closestShape = i; closestOtherShape = j; }
+                }
+                if (clearance <= Ring2DCollision.ContactDistance && closestRing != null)
+                {
+                    hitRing = closestRing; hitShape = closestShape; hitOtherShape = closestOtherShape;
+                    hitPosition = position+displacement*(float)t;
+                    hitAngle = (transform.parent != null ? transform.parent.rotation : Quaternion.identity).eulerAngles.z +
+                        (rotation*Quaternion.Euler(0, 0, degrees*(float)t)).eulerAngles.z;
+                    var point = Ring2DCollision.ContactPoint(worldShapes[hitShape], hitRing.worldShapes[hitOtherShape]);
+                    hitPoint = new Vector3((float)point.X, (float)point.Y, (position.z+hitRing.transform.position.z)/2);
+                }
+                return clearance;
+            };
+            double fraction;
+            if (blockedByContactOwner != null)
+            {
+                clearanceAt(0);
+                if (latchedClearance <= Ring2DCollision.ContactDistance)
+                {
+                    heldByContactOwner = true;
+                    fraction = Ring2DCollision.Sweep(travel, clearanceAt, out blocked, true); hitRing = blockedByContactOwner;
+                    hitShape = latchedShape; hitOtherShape = latchedOtherShape;
+                    hitPosition = position; hitAngle = transform.eulerAngles.z;
+                    var point = Ring2DCollision.ContactPoint(worldShapes[hitShape], hitRing.worldShapes[hitOtherShape]);
+                    hitPoint = new Vector3((float)point.X, (float)point.Y, (position.z+hitRing.transform.position.z)/2);
+                }
+                else { blockedByContactOwner = null; fraction = Ring2DCollision.Sweep(travel, clearanceAt, out blocked); }
+            }
+            else fraction = Ring2DCollision.Sweep(travel, clearanceAt, out blocked);
+            transform.localRotation = rotation * Quaternion.Euler(0, 0, degrees * (float)fraction);
+            transform.position = position + displacement * (float)fraction;
+            if (blocked && hitRing != null)
+            {
+                // A 主动碰到 B 时由 A 持有接触；B 被锁期间的拖动不能反过来锁住 A。
+                if (SharesMovementAxis(hitRing) && hitRing.blockedByContactOwner == this) hitRing.blockedByContactOwner = null;
+                if (!heldByContactOwner && !SharesMovementAxis(hitRing) &&
+                    (hitRing.blockedByContactOwner == null || hitRing.blockedByContactOwner == this))
+                    hitRing.blockedByContactOwner = this;
+                LastCollisionPoint = hitPoint; hitRing.LastCollisionPoint = hitPoint;
+                if (contactPartner != hitRing)
+                {
+                    contactPartner = hitRing; hitRing.contactPartner = this;
+                    CollisionBlocked?.Invoke(hitRing, hitPoint); hitRing.CollisionBlocked?.Invoke(this, hitPoint);
+                }
+            }
+            else if (fraction > 0)
+            {
+                if (contactPartner != null && contactPartner.contactPartner == this) contactPartner.contactPartner = null;
+                contactPartner = null;
+            }
+            if (blocked && hitRing != null && (lastLoggedObstacle != hitRing || Time.unscaledTime-lastCollisionLogTime >= 1))
+            {
+                Debug.Log($"几何碰撞：{name} [轮廓 {hitShape}] ↔ {hitRing.name} [轮廓 {hitOtherShape}]；" +
+                    $"接触发起者 {(heldByContactOwner ? hitRing.name : name)}；" +
+                    $"碰撞点（世界坐标）{hitPoint:F5}；" +
+                    $"受阻时位置 {hitPosition:F5}，Z 角 {hitAngle:F4}°；对方位置 {hitRing.transform.position:F5}，Z 角 {hitRing.transform.eulerAngles.z:F4}°；" +
+                    $"停止位置 {transform.position:F5}，Z 角 {transform.eulerAngles.z:F4}°", this);
+                lastLoggedObstacle = hitRing; lastCollisionLogTime = Time.unscaledTime;
+            }
+            UpdateWorldShapes(transform.localToWorldMatrix);
+        }
         /// <summary>根据父级配置刷新；Editor 显式操作可启用 recordUndo，让生成子对象随配置一起撤销。</summary>
         public bool Rebuild(bool recordUndo = false)
         {
@@ -170,7 +314,7 @@ namespace RotateRings
                     SetSprite(view.Head, new Vector2((float)pose.Head.X, (float)pose.Head.Y), angle - 90,
                         new Vector2(c.HeadWidth, c.HeadDepth), c.ShowHead, material, 1);
                 }
-                UpdateTriggers(); dirty = false; return true;
+                BuildCollisionShapes(poses); DisablePhysics(); dirty = false; return true;
             }
             catch (Exception exception) { Debug.LogError("二维圆环生成失败：" + exception.Message, this); return false; }
         }
@@ -239,49 +383,75 @@ namespace RotateRings
             renderer.transform.localScale = new Vector3(scale, scale, 1); renderer.size = size / scale;
         }
 
-        /// <summary>路径边保留内孔，杆/头各有 Box；实体模式为动态刚体，冻结中心但允许旋转。</summary>
-        private void UpdateTriggers()
+        /// <summary>缓存环身胶囊和连接件矩形；仅在形状参数改变后重建。</summary>
+        private void BuildCollisionShapes(Ring2DConnectionPose[] poses)
         {
-            bool enabled = PhysicsMode != Ring2DPhysicsMode.None;
-            bool trigger = PhysicsMode == Ring2DPhysicsMode.TriggerDetection;
-            if (enabled && generatedEdge == null) generatedEdge = gameObject.AddComponent<EdgeCollider2D>();
-            if (generatedEdge != null)
+            localShapes.Clear(); worldShapes.Clear();
+            var path = Ring2DGeometry.ColliderPath(Settings, ColliderSegments);
+            for (int i = 1; i < path.Length; i++)
             {
-                generatedEdge.enabled = enabled; generatedEdge.isTrigger = trigger; generatedEdge.edgeRadius = Settings.Thickness / 2;
-                Ring2DPoint[] path = Ring2DGeometry.ColliderPath(Settings, ColliderSegments); var points = new Vector2[path.Length];
-                for (int i = 0; i < points.Length; i++) points[i] = new Vector2((float)path[i].X, (float)path[i].Y);
-                generatedEdge.points = points;
+                var shape = new Ring2DCollisionShape(2) { Radius = Settings.Thickness / 2, IsRingBody = !DragsByMovement,
+                    RotationInvariant = Settings.Shape == Ring2DShape.Circle };
+                shape.Points[0] = path[i-1]; shape.Points[1] = path[i]; localShapes.Add(shape);
             }
-            if (enabled && GetComponent<Rigidbody2D>() == null) generatedBody = gameObject.AddComponent<Rigidbody2D>();
-            var body = GetComponent<Rigidbody2D>();
-            if (body != null && enabled)
+            for (int i = 0; i < poses.Length; i++)
             {
-                body.bodyType = trigger ? RigidbodyType2D.Kinematic : RigidbodyType2D.Dynamic; body.gravityScale = 0;
-                body.constraints = RigidbodyConstraints2D.FreezePosition | (LockRotation ? RigidbodyConstraints2D.FreezeRotation : RigidbodyConstraints2D.None);
-                body.collisionDetectionMode = CollisionDetectionMode2D.Continuous; body.interpolation = RigidbodyInterpolation2D.Interpolate;
-                body.angularDrag = 1; body.simulated = true;
+                var pose = poses[i]; var connection = Connections[i];
+                if (pose.Length > 0.00001) AddCollisionBox(new Ring2DPoint((pose.Start.X+pose.End.X)/2,
+                    (pose.Start.Y+pose.End.Y)/2), pose.DX, pose.DY, pose.Length, connection.RodWidth);
+                if (connection.ShowHead)
+                {
+                    AddCollisionBox(pose.Head, pose.DY, -pose.DX, connection.HeadWidth, connection.HeadDepth);
+                    localShapes[localShapes.Count-1].HeadPassageRadians = connection.AllowRingBodyPassage ? connection.PassageAngleDegrees*Math.PI/180 : 0;
+                }
             }
-            if (generatedBody != null) generatedBody.simulated = enabled;
-            foreach (var view in views) foreach (var renderer in new[] { view.Rod, view.Head })
+            foreach (var shape in localShapes) worldShapes.Add(new Ring2DCollisionShape(shape.Points.Length));
+        }
+
+        private void AddCollisionBox(Ring2DPoint center, double dx, double dy, double width, double height)
+        {
+            var shape = new Ring2DCollisionShape(4);
+            for (int i = 0; i < 4; i++)
             {
-                var box = renderer.GetComponent<BoxCollider2D>();
-                if (enabled && box == null) box = renderer.gameObject.AddComponent<BoxCollider2D>();
-                if (box != null) { box.isTrigger = trigger; box.size = renderer.size; box.offset = Vector2.zero; box.enabled = enabled && renderer.gameObject.activeSelf; }
+                double x = (i == 0 || i == 3 ? -1 : 1) * width / 2;
+                double y = (i < 2 ? -1 : 1) * height / 2;
+                shape.Points[i] = new Ring2DPoint(center.X + dx*x - dy*y, center.Y + dy*x + dx*y);
             }
-            // 连接头的 Box 会把自动质心拉向环边，而 Edge 本身没有面积。
-            // FreezePosition 固定的是质心；必须显式设为环心，否则会绕连接头旋转并偏移本体。
-            if (body != null && enabled)
+            localShapes.Add(shape);
+        }
+
+        private void UpdateWorldShapes(Matrix4x4 matrix)
+        {
+            double scale = Math.Max(matrix.MultiplyVector(Vector3.right).magnitude, matrix.MultiplyVector(Vector3.up).magnitude);
+            Vector3 center = matrix.MultiplyPoint3x4(Vector3.zero);
+            for (int i = 0; i < localShapes.Count; i++)
             {
-                body.centerOfMass = Vector2.zero;
-                // Edge 没有面积，只有环身时自动转动惯量为零。用环/矩形近似保证角向碰撞响应。
-                float span = Settings.Shape == Ring2DShape.ZShape ? Settings.ZTopWidth + Settings.ZBottomWidth : Settings.Width;
-                float radiusSquared = Settings.Shape == Ring2DShape.Circle || Settings.Shape == Ring2DShape.CShape
-                    ? Settings.Radius * Settings.Radius
-                    : (span * span + (Settings.Shape == Ring2DShape.Straight ? Settings.Thickness * Settings.Thickness : Settings.Height * Settings.Height)) / 12;
-                body.inertia = Mathf.Max(0.001f, body.mass * radiusSquared);
+                var local = localShapes[i]; var world = worldShapes[i]; world.Radius = local.Radius * scale;
+                world.IsRingBody = local.IsRingBody; world.HeadPassageRadians = local.HeadPassageRadians;
+                world.RotationInvariant = local.RotationInvariant;
+                world.CircleCenter = new Ring2DPoint(center.x, center.y);
+                for (int j = 0; j < local.Points.Length; j++)
+                {
+                    var point = local.RotationInvariant
+                        ? new Vector3(center.x+(float)(local.Points[j].X*scale), center.y+(float)(local.Points[j].Y*scale), center.z)
+                        : matrix.MultiplyPoint3x4(new Vector3((float)local.Points[j].X, (float)local.Points[j].Y, 0));
+                    world.Points[j] = new Ring2DPoint(point.x, point.y);
+                }
+                world.UpdateBounds();
             }
         }
 
+        /// <summary>旧场景的自动碰撞体保留为禁用状态，不再创建或模拟刚体。</summary>
+        private void DisablePhysics()
+        {
+            foreach (var body in GetComponents<Rigidbody2D>()) body.simulated = false;
+            foreach (var collider in GetComponents<Collider2D>()) collider.enabled = false;
+            foreach (var view in views)
+            {
+                if (view == null) continue;
+                foreach (var collider in view.GetComponentsInChildren<Collider2D>(true)) collider.enabled = false;
+            }
+        }
         private static void DeleteObject(UnityEngine.Object obj, bool undo)
         {
 #if UNITY_EDITOR
@@ -291,10 +461,13 @@ namespace RotateRings
         }
 
         private Vector3 PointerPoint()
+        { return transform.InverseTransformPoint(PointerWorldPoint()); }
+
+        private Vector3 PointerWorldPoint()
         {
             var plane = new Plane(transform.forward, transform.position); float distance;
             Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition);
-            return plane.Raycast(ray, out distance) ? transform.InverseTransformPoint(ray.GetPoint(distance)) : Vector3.zero;
+            return plane.Raycast(ray, out distance) ? ray.GetPoint(distance) : transform.position;
         }
         private float PointerAngle()
         {
@@ -324,7 +497,10 @@ namespace RotateRings
         private void OnDisable()
         {
             if (dragged == this) dragged = null;
-            pendingRotation = 0;
+            blockedByContactOwner = null;
+            if (contactPartner != null && contactPartner.contactPartner == this) contactPartner.contactPartner = null;
+            contactPartner = null;
+            activeRings.Remove(this);
             if (generatedEdge != null) generatedEdge.enabled = false;
             if (generatedBody != null) generatedBody.simulated = false;
             ReleaseOwnedMesh();

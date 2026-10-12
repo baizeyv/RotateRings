@@ -12,8 +12,11 @@ public sealed class ProceduralRing2DEditor : Editor
     public override void OnInspectorGUI()
     {
         serializedObject.Update();
-        DrawPropertiesExcluding(serializedObject, "m_Script", "Connections", "Settings");
+        DrawPropertiesExcluding(serializedObject, "m_Script", "Connections", "Settings", "MovementAxis");
         DrawSettings();
+        var shape = (Ring2DShape)serializedObject.FindProperty("Settings").FindPropertyRelative("Shape").enumValueIndex;
+        if (shape == Ring2DShape.Straight || shape == Ring2DShape.Gate || shape == Ring2DShape.Seven || shape == Ring2DShape.ZShape)
+            EditorGUILayout.PropertyField(serializedObject.FindProperty("MovementAxis"), new GUIContent("移动方向（世界坐标）"));
         bool changed = serializedObject.ApplyModifiedProperties();
         var ring = (ProceduralRing2D)target;
         int oldCount = ring.Connections == null ? 0 : ring.Connections.Length;
@@ -42,6 +45,12 @@ public sealed class ProceduralRing2DEditor : Editor
                 EditorGUILayout.PropertyField(entry.FindPropertyRelative("DirectionOffsetDegrees"), new GUIContent("方向偏转角"));
             }
             foreach (string name in new[] { "RodWidth", "ShowHead", "HeadWidth", "HeadDepth" }) EditorGUILayout.PropertyField(entry.FindPropertyRelative(name));
+            if (entry.FindPropertyRelative("ShowHead").boolValue)
+            {
+                var passage = entry.FindPropertyRelative("AllowRingBodyPassage");
+                EditorGUILayout.PropertyField(passage, new GUIContent("允许圆环身沿连接头穿过"));
+                if (passage.boolValue) EditorGUILayout.Slider(entry.FindPropertyRelative("PassageAngleDegrees"), 0, 90, new GUIContent("通道方向允许夹角"));
+            }
             if (GUILayout.Button("删除此连接点")) { connections.DeleteArrayElementAtIndex(i); changed = true; EditorGUILayout.EndVertical(); break; }
             EditorGUILayout.EndVertical();
         }
@@ -52,7 +61,7 @@ public sealed class ProceduralRing2DEditor : Editor
             EditorGUILayout.HelpBox("ZShape 为阶梯折线：上段向右 → 中段向下 → 下段向右。TopWidth 和 BottomWidth 独立控制两段宽度，Height 是上下横边间距；中间竖段固定在局部 X=0。PathPosition 沿实际路径长度分配。", MessageType.Info);
         if (ring.Settings.Shape == Ring2DShape.Gate || ring.Settings.Shape == Ring2DShape.Seven || ring.Settings.Shape == Ring2DShape.ZShape)
             EditorGUILayout.HelpBox("CornerRadius 控制转角中心线半径，显示和碰撞都使用圆角；须大于 Thickness/2。门字最大为 min(Width/2, Height)，7 字为 min(Width, Height)，Z 字为 min(TopWidth, BottomWidth, Height/2)。", MessageType.Info);
-        EditorGUILayout.HelpBox("BlockRotation 使用动态 Rigidbody2D 和实体碰撞，冻结中心位置，通过 FixedUpdate / MoveRotation 旋转；LockRotation 冻结整个环。TriggerDetection 只检测，不阻挡；None 关闭自动碰撞体。生成子对象由父级管理，应在此调整配置。", MessageType.Info);
+        EditorGUILayout.HelpBox("圆/C 环拖动旋转；直线、门形、7/Z 形沿配置轴拖动移动。连接头可作为导向卡扣：圆/C 环身与头横轴的夹角在允许范围内时可滑过，连接杆仍阻挡。LockRotation 只锁旋转。None 和旧 TriggerDetection 不阻挡，也不产生物理触发事件。请使用 XY 平面和均匀缩放，实体阻挡部分初始不要穿插。", MessageType.Info);
         if (GUILayout.Button("使用原图 A / B 示例 Sprite"))
         { Undo.RecordObject(ring, "指定 A/B 图"); Ring2DDemoEditor.AssignSprites(ring); ring.Rebuild(true); EditorUtility.SetDirty(ring); }
         if (GUILayout.Button("刷新本体 / 连接点 / 碰撞体")) ring.Rebuild(true);
@@ -138,11 +147,10 @@ public sealed class ProceduralRing2DEditor : Editor
 
 public static class Ring2DDemoEditor
 {
-    public const string ScenePath = "Assets/RotateRings/Ring2D/Scenes/Ring2DDemo.unity";
-    private const string TexturePath = "Assets/RotateRings/Ring2D/Textures/ringextra_2d.png";
+    public const string ScenePath = "Assets/RotateRings/Scenes/Ring2DDemo.unity";
+    private const string TexturePath = "Assets/RotateRings/Textures/ringextra_2d.png";
     public static void AssignSprites(ProceduralRing2D ring)
     {
-        if (!File.Exists(TexturePath)) { File.Copy("Assets/RotateRings/Textures/ringextra.png", TexturePath); AssetDatabase.ImportAsset(TexturePath); }
         var all = AssetDatabase.LoadAllAssetsAtPath(TexturePath).OfType<Sprite>().ToArray();
         if (all.Length == 0)
         {
@@ -160,13 +168,13 @@ public static class Ring2DDemoEditor
             importer.SaveAndReimport(); all = AssetDatabase.LoadAllAssetsAtPath(TexturePath).OfType<Sprite>().ToArray();
         }
         ring.BodySprite = all.First(s => s.name == "RingBody_A"); ring.ConnectionSprite = all.First(s => s.name == "RingConnector_B");
-        const string materialPath = "Assets/RotateRings/Ring2D/Materials/Ring2D.mat";
+        const string materialPath = "Assets/RotateRings/Materials/Ring2D.mat";
         var material = AssetDatabase.LoadAssetAtPath<Material>(materialPath);
         if (material == null) { material = new Material(Shader.Find("RotateRings/Ring 2D")); AssetDatabase.CreateAsset(material, materialPath); }
         ring.RenderMaterial = material;
     }
 
-    [MenuItem("Tools/Rotate Rings/打开 A-B 二维圆环与物理示例")]
+    [MenuItem("Tools/Rotate Rings/打开 A-B 二维圆环与几何阻挡示例")]
     public static void Open()
     {
         if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo()) return;

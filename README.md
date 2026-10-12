@@ -1,8 +1,8 @@
-# 二维圆环（A/B 贴图与 Physics2D）
+# 二维圆环（A/B 贴图与几何阻挡）
 
 这次新增功能集中在此目录：Runtime 为运行时脚本，Editor 为父级 Inspector 和示例生成工具，Shaders 为二维透明材质，Textures、Materials、Scenes 为示例资源。此前的 UI 和 3D 原型仍保留在原目录。
 
-通过 **Tools → Rotate Rings → 打开 A-B 二维圆环与物理示例** 打开示例，进入 Play 后拖动环身或连接头旋转。右下橙色环的头会被蓝色 C 环实体挡住；左上按钮可以解锁外环，旋转外环改变缺口位置。
+通过 **Tools → Rotate Rings → 打开 A-B 二维圆环与几何阻挡示例** 打开示例，进入 Play 后拖动环身或连接头旋转。左上按钮可以解锁示例外环。圆/C 环身可沿橙色连接头的卡扣通道滑过；方向不匹配或碰到连接杆时仍受阻挡。
 
 通过 **GameObject → 2D Object → 程序化圆环（A/B）** 创建新对象。父级 `ProceduralRing2D` 管理本体、连接点和碰撞体，无须 Canvas。
 
@@ -24,17 +24,21 @@ ZShape 为确认的阶梯折线：Inspector 的上横段宽度 TopWidth、下横
 
 旧场景的 TopWidth/BottomWidth 未设置（0）时，组件沿用旧 Width/2，保持原造型；Inspector 显示实际宽度，首次修改任一宽度会把两段都保存为独立值，此后 Width 不参与 Z 形计算。运行时代码可直接设置 Settings.TopWidth 和 Settings.BottomWidth 为正数。
 
-Direction 选择向内/向外。向内且 ToCenter 开启时，头中心默认到父级原点；关闭后 Length 控制杆长，DirectionOffsetDegrees 调整杆方向。RodWidth 为杆宽；HeadWidth 为头的横向宽度，HeadDepth 为沿杆方向的厚度，ShowHead 可关闭头。头相对杆始终垂直。生成的连接杆和连接头是独立 SpriteRenderer 子对象，配置仍由父级维护，手动改子对象会在刷新时覆盖。
+Direction 选择向内/向外。向内且 ToCenter 开启时，头中心默认到父级原点；关闭后 Length 控制杆长，DirectionOffsetDegrees 调整杆方向。RodWidth 为杆宽；HeadWidth 为头的横向宽度，HeadDepth 为沿杆方向的厚度，ShowHead 可关闭头。头相对杆始终垂直。连接点的“允许圆环身沿连接头穿过”（AllowRingBodyPassage）默认开启：连接头作为有通道的导向卡扣，圆/C 环的环身可沿头横轴滑过。“通道方向允许夹角”（PassageAngleDegrees，默认 30°）以连接头中心对应的圆环切线（圆心到连接头中心径向的垂线）与连接头横轴比较，正反方向均允许；不再使用各离散段的方向，因此收紧角度不会把卡扣两侧的曲率误判为未对齐；这是局部通道夹角，不是固定世界角度。超出夹角范围时头仍阻挡。连接杆、其他连接头和直线/门形/7/Z 形不享受通行规则。关闭此选项会将连接头恢复为实心障碍。生成的连接杆和连接头是独立 SpriteRenderer 子对象，配置仍由父级维护，手动改子对象会在刷新时覆盖。
 
-## 真实物理旋转
+## 几何阻挡（无真实物理）
 
-PhysicsMode 默认 **BlockRotation**：本体用带半径的 EdgeCollider2D 保留内孔，杆/头用 BoxCollider2D，全部为实体。动态 Rigidbody2D 无重力、冻结中心位置；在 FixedUpdate 通过 MoveRotation 提交旋转请求，由 Physics2D 接触求解阻挡，受阻后的角度以刚体实际结果为准。LockRotation 进一步冻结角度。
+Collision Mode 选择几何阻挡（旧字段 PhysicsMode 的 BlockRotation 数值保持兼容）。环身使用中心线路径加 Thickness/2 的胶囊段，连接杆与头使用实心矩形。Rebuild 缓存局部轮廓；运动时只更新世界坐标，包围盒先排除不可能接触的轮廓，再精确计算间距。
 
-父级 `ColliderSegments` 独立控制碰撞采样，默认 32（范围 8–128），显示网格仍用 Settings.Segments。默认圆环 33 点（含闭合点）、270° C 环 25 点、门字环 20 点、7 字环 11 点、Z 字环 20 点、直线 2 点；门字/7/Z 的直边只保留端点，每个圆角默认 8 段。连接杆/头继续使用 BoxCollider2D。降低采样会使曲线碰撞轮廓更粗，狭窄缺口可单独提高 ColliderSegments；旋转时不会重新生成这些点。圆角占满直边时重合采样点会去重，点数可进一步减少。
+圆环 Circle 和 C 环 CShape 用鼠标拖动旋转；直线 Straight、门形 Gate、7 形 Seven、Z 形 ZShape 用鼠标拖动平移。在父级 Inspector 的“移动方向（世界坐标）”选择左右或上下，默认左右；物件旋转后移动轴仍为世界坐标。连接杆与连接头跟随本体移动，并参与几何阻挡，可作为卡扣。受阻时丢弃剩余鼠标位移，反向拖动立即响应。`RequestRotation(角度增量)` 立即旋转，LockRotation 禁止旋转但不禁止四种移动形状的拖动。`RequestMovement(Vector2世界位移)` 对四种移动形状投影到配置轴；圆/C 环的程序化移动仍为 XY 位移。禁止直接修改 Transform 来执行需要阻挡的运动。
 
-TriggerDetection 仅触发检测，不阻挡；None 关闭自动碰撞体。运行时脚本请求旋转请调用 `RequestRotation(角度增量)`，不要直接改 Transform。请保持父级位于 XY 平面，使用均匀缩放，碰撞层之间允许接触。两个可动环接触时可以互相推动旋转；固定障碍可开启 LockRotation。
+检测根据当前轮廓间距和最大运动距离保守推进，检查整个旋转或移动路径；遇阻立即丢弃剩余请求，停在安全位置，不再回退。主动拖动的物件 A 碰到 B 后，由 A 持有接触状态：B 的移动和旋转锁住，A 仍可沿解除接触的方向运动，但不能继续穿入 B。B 被锁期间的拖动不会反过来锁住 A。A 退出接触后，B 再次请求运动时自动解锁。例外：两个移动形状配置同一移动轴（都左右或都上下）时不建立对方锁定，双方都可沿脱离接触的方向移动，继续挤入仍被几何检测阻止。完整 Circle 的环身碰撞轮廓保持旋转不变，主动旋转只检测连接件；C 环的缺口与环身仍随旋转更新。Console 输出受阻双方的名称、轮廓序号、接触发起者、世界坐标、Z 角、碰撞点世界坐标和停止位置；同一对对象连续受阻时每秒最多输出一次。碰撞点取两个轮廓最近表面的中点，可用于播放接触动画。两个对象首次进入同一对接触时各触发一次 `CollisionBlocked(other, worldPoint)` 事件；接触解除后可再次触发。`LastCollisionPoint` 保存最近碰撞点，持续受阻时更新。不使用 FixedUpdate、MoveRotation、碰撞响应或刚体模拟，不会推动其他环。每次最多推进 512 步，达到上限停在已经验证的安全位置。
 
-演示只展示形状、连接点编辑和物理阻挡，不自动判胜或移除圆环。运行时旋转不重建 Mesh；只有修改形状/连接参数才需要 Rebuild。
+旧场景中的 Collider2D 被禁用，Rigidbody2D.simulated 设为 false；组件不再创建物理组件。None 和旧 TriggerDetection 模式自由运动，也不产生 OnTrigger/OnCollision 回调。阻挡对象为启用且选择几何阻挡模式的 ProceduralRing2D；普通场景 Collider2D 不参与此检测。
+
+ColliderSegments 独立控制环身轮廓采样（8–128），显示网格仍用 Settings.Segments。保持父级和祖先在 XY 平面、使用均匀缩放；狭窄缺口可提高轮廓采样。实体阻挡部分的初始轮廓应避免互相穿插；环身与方向匹配的连接头通道可重叠，本方案不负责自动分离实体重叠对象。
+
+演示展示形状、连接点编辑和几何阻挡，不自动判胜或移除圆环。运行时旋转不重建 Mesh；修改形状或连接参数后需 Rebuild。
 
 ## 保存本体 Mesh
 
@@ -42,14 +46,14 @@ TriggerDetection 仅触发检测，不阻挡；None 关闭自动碰撞体。运�
 
 颜色、材质、连接点、ColliderSegments 可继续调整，不使本体 Mesh 失效。Settings 中的形状参数或 BodySprite（包括 UV / 圆头范围）改变后自动回到程序化生成，避免显示和碰撞形状错位；Inspector 提示重新另存。**恢复程序化本体 Mesh** 清除绑定，保留已有资源。
 
-这里只保存本体网格，不包含 B SpriteRenderer 子元素或碰撞体；组件启用仍需配置它们。要保存整件环及连接点，请同时保存 Prefab。
+这里只保存本体网格，不包含 B SpriteRenderer 子元素或几何阻挡轮廓；组件启用仍需生成它们。要保存整件环及连接点，请同时保存 Prefab。
 
 本次圆角更新会使此前烘焙的 Mesh 自动失效并恢复程序化预览，请重新点击另存按钮，以使用新版网格资源。
 
 ## 文件与验证
 
-`ProceduralRing2D.cs` 负责显示、输入和碰撞体；`Ring2DGeometry.cs` 计算路径/UV/连接位置；`Ring2DConnectionView.cs` 保存子对象引用；`Ring2DDemoLabels.cs` 为示例说明；Editor 中的 `ProceduralRing2DEditor.cs` 管理 Inspector 和示例。
+`ProceduralRing2D.cs` 负责显示、输入和几何受限运动；`Ring2DGeometry.cs` 计算路径/UV/连接位置；`Ring2DCollision.cs` 计算轮廓间距和保守运动；`Ring2DConnectionView.cs` 保存子对象引用；`Ring2DDemoLabels.cs` 为示例说明；Editor 中的 `ProceduralRing2DEditor.cs` 管理 Inspector 和示例。
 
-复用原目录的 `RingGeometry.cs`（网格数据）、`RingUIGeometry.cs`（圆/弧/直线几何）、`RingPuzzleRules.cs`（角度工具），因此此文件夹用于功能区分，复制到别的项目时还需带上这些共享依赖。
+网格数据、六种形状的几何生成和角度归一化均包含在 `Ring2DGeometry.cs` 中，不再依赖旧原型目录。
 
-`Tools/Test-RingGeometry.ps1` 检查几何并编译 Unity 代码。`Tools/Prepare-RingSceneCheck.py`、`Tools/Prepare-Ring2DCheck.py` 在 Temp 中建立隔离测试项目，原生 Unity 检查示例渲染、实体接触阻挡、缺口通过、反向旋转、固定中心和碰撞体刷新。
+在项目根目录运行 `./Tools/Test-RingGeometry.ps1`，检查六种形状的网格、三角形朝向、UV、轮廓距离、快速旋转/移动阻挡、反向退出、C 环缺口、卡扣通道角度边界、周围四环旋转、四种移动形状的卡扣阻挡、Circle 接触 Z 后双向锁定、解除接触后恢复移动、Gate 主动接触 Circle 后退出、完整圆环旋转轮廓不变、同轴横向/竖向双方退出接触以及碰撞点计算。Unity 编译和运行验证需在编辑器中执行。

@@ -6,6 +6,9 @@ namespace RotateRings
     public enum Ring2DShape { Circle, Straight, CShape, Gate, Seven, ZShape }
     public enum Ring2DConnectionDirection { Outward, Inward }
 
+    public struct RingVertex { public float X, Y, NZ, U, V; }
+    public sealed class RingMeshData { public RingVertex[] Vertices; public int[] Triangles; }
+
     /// <summary>二维路径参数，使用世界局部单位；门字、7/Z 均用 CornerRadius 将转角圆滑连接。</summary>
     [Serializable]
     public sealed class Ring2DSettings
@@ -49,12 +52,16 @@ namespace RotateRings
         public float Length = 0.5f, RodWidth = 0.14f, DirectionOffsetDegrees;
         public bool ShowHead = true;
         public float HeadWidth = 0.42f, HeadDepth = 0.22f;
+        // 头作为带通道的卡扣，圆/C 环身沿头的横轴滑过；杆仍为实体。
+        public bool AllowRingBodyPassage = true;
+        public float PassageAngleDegrees = 30;
         public void Validate()
         {
-            foreach (float v in new[] { AngleDegrees, PathPosition, Length, RodWidth, DirectionOffsetDegrees, HeadWidth, HeadDepth })
+            foreach (float v in new[] { AngleDegrees, PathPosition, Length, RodWidth, DirectionOffsetDegrees, HeadWidth, HeadDepth, PassageAngleDegrees })
                 if (float.IsNaN(v) || float.IsInfinity(v)) throw new ArgumentException("连接参数必须为有限数值。");
             if (!Enum.IsDefined(typeof(Ring2DConnectionDirection), Direction) || PathPosition < 0 || PathPosition > 1 ||
-                Length < 0 || RodWidth <= 0 || HeadWidth <= 0 || HeadDepth <= 0) throw new ArgumentException("连接位置或尺寸无效。");
+                Length < 0 || RodWidth <= 0 || HeadWidth <= 0 || HeadDepth <= 0 || PassageAngleDegrees < 0 || PassageAngleDegrees > 90)
+                throw new ArgumentException("连接位置、尺寸或通行角度无效。");
         }
     }
 
@@ -149,13 +156,12 @@ namespace RotateRings
             s.Validate();
             if (double.IsNaN(capFraction) || double.IsInfinity(capFraction) || capFraction <= 0 || capFraction >= 0.5)
                 throw new ArgumentException("A 图圆头比例须介于 0 和 0.5。");
-            if (s.Shape != Ring2DShape.Gate && s.Shape != Ring2DShape.Seven && s.Shape != Ring2DShape.ZShape)
-                return RingUIGeometry.Build(new UIRingSettings {
-                    Shape = s.Shape == Ring2DShape.Circle ? UIRingShape.Circle : s.Shape == Ring2DShape.Straight ? UIRingShape.Straight : UIRingShape.CShape,
-                    Radius = s.Radius, Length = s.Width, Thickness = s.Thickness, StartDegrees = s.StartDegrees, SweepDegrees = s.SweepDegrees,
-                    Segments = s.Segments, CapSegments = s.CapSegments, UVLeft = 0, UVRight = 1, UVBottom = 0, UVTop = 1, UVCapFraction = (float)capFraction });
             var vertices = new List<RingVertex>(); var triangles = new List<int>();
-            var knots = RoundedKnots(s, s.Segments);
+            var knots = new SortedSet<double> { 0, 1 };
+            if (s.Shape == Ring2DShape.Gate || s.Shape == Ring2DShape.Seven || s.Shape == Ring2DShape.ZShape)
+                knots = RoundedKnots(s, s.Segments);
+            else if (s.Shape != Ring2DShape.Straight)
+                for (int i = 1; i < s.Segments; i++) knots.Add((double)i / s.Segments);
             double previous = -1;
             foreach (double t in knots)
             {
@@ -168,7 +174,7 @@ namespace RotateRings
                 }
                 previous = t;
             }
-            AppendCaps(s, capFraction, vertices, triangles);
+            if (s.Shape != Ring2DShape.Circle) AppendCaps(s, capFraction, vertices, triangles);
             return new RingMeshData { Vertices = vertices.ToArray(), Triangles = triangles.ToArray() };
         }
 
@@ -226,7 +232,7 @@ namespace RotateRings
             double x, y, tx, ty, nx, ny;
             if (s.Shape == Ring2DShape.Circle || s.Shape == Ring2DShape.CShape)
             {
-                double delta = RingPuzzleRules.Wrap(connection.AngleDegrees - s.StartDegrees);
+                double delta = ((connection.AngleDegrees - s.StartDegrees) % 360 + 360) % 360;
                 if (s.Shape == Ring2DShape.CShape && delta > s.SweepDegrees + 0.00001) throw new ArgumentException("连接点位于 C 环缺口中。");
                 double angle = connection.AngleDegrees * Math.PI / 180;
                 nx = Math.Cos(angle); ny = Math.Sin(angle); x = s.Radius * nx; y = s.Radius * ny;
