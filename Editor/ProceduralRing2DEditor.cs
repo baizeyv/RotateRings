@@ -4,6 +4,7 @@ using System.Linq;
 using RotateRings;
 using UnityEditor;
 using UnityEditor.SceneManagement;
+using UnityEditor.U2D.Sprites;
 using UnityEngine;
 
 [CustomEditor(typeof(ProceduralRing2D))]
@@ -12,11 +13,28 @@ public sealed class ProceduralRing2DEditor : Editor
     public override void OnInspectorGUI()
     {
         serializedObject.Update();
-        DrawPropertiesExcluding(serializedObject, "m_Script", "Connections", "Settings", "MovementAxis");
+        DrawPropertiesExcluding(serializedObject, "m_Script", "Connections", "Settings", "MovementAxis", "Clasps");
         DrawSettings();
         var shape = (Ring2DShape)serializedObject.FindProperty("Settings").FindPropertyRelative("Shape").enumValueIndex;
         if (shape == Ring2DShape.Straight || shape == Ring2DShape.Gate || shape == Ring2DShape.Seven || shape == Ring2DShape.ZShape)
-            EditorGUILayout.PropertyField(serializedObject.FindProperty("MovementAxis"), new GUIContent("移动方向（世界坐标）"));
+        {
+            EditorGUILayout.PropertyField(serializedObject.FindProperty("Clasps"), new GUIContent("固定 C 卡扣"), true);
+            if (GUILayout.Button(shape == Ring2DShape.Gate ? "添加左右两个竖向 C 卡扣" : "添加固定 C 卡扣"))
+            {
+                serializedObject.ApplyModifiedProperties();
+                if(shape == Ring2DShape.Gate) CreateGateClasps((ProceduralRing2D)target);
+                else CreateClasp((ProceduralRing2D)target);
+                serializedObject.Update();
+            }
+            var current = (ProceduralRing2D)target;
+            bool hasClasp = current.Clasps != null && current.Clasps.Any(c => c != null && c.isActiveAndEnabled);
+            using (new EditorGUI.DisabledScope(hasClasp)) EditorGUILayout.PropertyField(serializedObject.FindProperty("MovementAxis"), new GUIContent("无卡扣时移动方向"));
+            if (current.Clasps != null) foreach (var clasp in current.Clasps) if (clasp != null) DrawClasp(clasp);
+            Vector2 axis;
+            if (!current.TryMovementDirection(out axis)) EditorGUILayout.HelpBox("卡扣尺寸无效或通道不平行，物件无法移动。", MessageType.Error);
+            else EditorGUILayout.LabelField("实际世界移动方向", axis.ToString("F3"));
+            EditorGUILayout.HelpBox("C 卡扣为场景中独立固定对象，物件从中滑过。通道角度 0° 向右、90° 向上；多个卡扣必须平行。通道宽度须大于环身 Thickness，圆角或连接头碰到轨道时会停止。移除数组引用不会删除场景卡扣，它仍是几何障碍；不再使用时请删除或禁用卡扣对象。", MessageType.Info);
+        }
         bool changed = serializedObject.ApplyModifiedProperties();
         var ring = (ProceduralRing2D)target;
         int oldCount = ring.Connections == null ? 0 : ring.Connections.Length;
@@ -74,6 +92,73 @@ public sealed class ProceduralRing2DEditor : Editor
         }
         using (new EditorGUI.DisabledScope(Application.isPlaying))
             if (GUILayout.Button("另存本体 Mesh 并使用（Assets/Mesh）")) SaveMesh(ring);
+    }
+
+    private static void DrawClasp(Ring2DClasp clasp)
+    {
+        EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+        EditorGUILayout.LabelField(clasp.name, EditorStyles.boldLabel);
+        Vector3 previous = clasp.transform.position;
+        EditorGUI.BeginChangeCheck();
+        Vector2 position = EditorGUILayout.Vector2Field("固定位置（世界）", previous);
+        float angle = EditorGUILayout.FloatField("通道角度（世界）", Mathf.Atan2(clasp.Direction.y, clasp.Direction.x)*Mathf.Rad2Deg);
+        if (EditorGUI.EndChangeCheck())
+        {
+            Undo.RecordObject(clasp.transform,"调整固定卡扣");
+            clasp.transform.position = new Vector3(position.x,position.y,previous.z);
+            clasp.Refresh();
+            clasp.transform.rotation = Quaternion.Euler(0,0,angle);
+        }
+        var data = new SerializedObject(clasp); data.Update();
+        foreach(string name in new[]{"ClaspSprite","RenderMaterial","Color","Width","Length","ChannelWidth","SortingLayer","SortingOrder"}) EditorGUILayout.PropertyField(data.FindProperty(name));
+        if(data.ApplyModifiedProperties()) {clasp.Refresh();EditorUtility.SetDirty(clasp);}
+        if(!clasp.Valid)EditorGUILayout.HelpBox("Width 必须大于 ChannelWidth，所有尺寸须为正数。",MessageType.Error);
+        if(GUILayout.Button("选中场景中的卡扣"))Selection.activeGameObject=clasp.gameObject;
+        EditorGUILayout.EndVertical();
+    }
+
+    /// <summary>卡扣不作为移动环的子对象；初始放在第一段直边中点，通道对齐该处切线。</summary>
+    public static Ring2DClasp CreateClasp(ProceduralRing2D ring)
+    {
+        if(!ring.DragsByMovement)throw new InvalidOperationException("只有直线、门形、7/Z 支持导向卡扣。");
+        Sprite sprite=Ring2DDemoEditor.GetClaspSprite();
+        var s=ring.Settings;double straight=s.Width, start=0;
+        if(s.Shape==Ring2DShape.Gate)straight=s.Height-s.CornerRadius;
+        else if(s.Shape==Ring2DShape.Seven)straight=s.Width-s.CornerRadius;
+        else if(s.Shape==Ring2DShape.ZShape)straight=s.ZTopWidth-s.CornerRadius;
+        if(straight<=0.0001 && (s.Shape==Ring2DShape.Seven || s.Shape==Ring2DShape.ZShape))
+        {
+            start=Math.PI*s.CornerRadius/2;
+            straight=s.Height-(s.Shape==Ring2DShape.Seven?s.CornerRadius:2*s.CornerRadius);
+        }
+        double x,y,tx,ty,nx,ny;Ring2DGeometry.Frame(s,(start+Math.Max(0,straight)/2)/Ring2DGeometry.PathLength(s),out x,out y,out tx,out ty,out nx,out ny);
+        var go=new GameObject(ring.name+" - 固定 C 卡扣");
+        UnityEngine.SceneManagement.SceneManager.MoveGameObjectToScene(go,ring.gameObject.scene);
+        go.transform.position=ring.transform.TransformPoint(new Vector3((float)x,(float)y,0));
+        var tangent=ring.transform.TransformVector(new Vector3((float)tx,(float)ty,0));
+        go.transform.rotation=Quaternion.Euler(0,0,Mathf.Atan2(tangent.y,tangent.x)*Mathf.Rad2Deg-90);
+        var clasp=go.AddComponent<Ring2DClasp>();clasp.ClaspSprite=sprite;clasp.RenderMaterial=ring.RenderMaterial;
+        clasp.SortingLayer=ring.SortingLayer;clasp.SortingOrder=ring.SortingOrder+10;
+        clasp.ChannelWidth=ring.Settings.Thickness+0.06f;clasp.Width=Mathf.Max(0.5f,clasp.ChannelWidth+0.2f);
+        clasp.Length=Mathf.Min(0.65f,Mathf.Max(0.1f,(float)straight*0.8f));clasp.Refresh();
+        Undo.RegisterCreatedObjectUndo(go,"添加固定 C 卡扣");Undo.RecordObject(ring,"绑定固定 C 卡扣");
+        var list=ring.Clasps==null?new Ring2DClasp[0]:ring.Clasps;
+        ring.Clasps=list.Concat(new[]{clasp}).ToArray();EditorUtility.SetDirty(ring);
+        EditorSceneManager.MarkSceneDirty(ring.gameObject.scene);return clasp;
+    }
+
+    /// <summary>门形竖向移动的双卡扣预设：左右竖边各一个，通道均沿世界 Y 轴，作为一次撤销操作。</summary>
+    public static Ring2DClasp[] CreateGateClasps(ProceduralRing2D ring)
+    {
+        if(ring.Settings.Shape!=Ring2DShape.Gate)throw new InvalidOperationException("双卡扣预设只适用于门形。");
+        Undo.IncrementCurrentGroup();int group=Undo.GetCurrentGroup();
+        var left=CreateClasp(ring);var right=CreateClasp(ring);
+        left.name=ring.name+" - 左侧固定 C 卡扣";right.name=ring.name+" - 右侧固定 C 卡扣";
+        var s=ring.Settings;
+        right.transform.position=ring.transform.TransformPoint(new Vector3(s.Width/2,-s.Height/2+(s.Height-s.CornerRadius)/2,0));
+        left.transform.rotation=right.transform.rotation=Quaternion.Euler(0,0,90);
+        Undo.CollapseUndoOperations(group);
+        return new[]{left,right};
     }
 
     /// <summary>Z 形只显示独立的两段宽度，兼容旧 Width/2 值；一次编辑即固定两段的独立配置。</summary>
@@ -148,7 +233,44 @@ public sealed class ProceduralRing2DEditor : Editor
 public static class Ring2DDemoEditor
 {
     public const string ScenePath = "Assets/RotateRings/Scenes/Ring2DDemo.unity";
-    private const string TexturePath = "Assets/RotateRings/Textures/ringextra_2d.png";
+    public const string ClaspScenePath = "Assets/RotateRings/Ring2D/Scenes/ClaspDemo.unity";
+    private const string TexturePath = "Assets/RotateRings/Ring2D/Textures/ringextra_2d.png";
+    [MenuItem("Tools/Rotate Rings/打开固定 C 卡扣示例")]
+    public static void OpenClaspDemo()
+    {
+        if(!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo())return;
+        if(File.Exists(ClaspScenePath)){EditorSceneManager.OpenScene(ClaspScenePath);return;}
+        var scene=EditorSceneManager.NewScene(NewSceneSetup.EmptyScene,NewSceneMode.Single);
+        var camera=new GameObject("Main Camera").AddComponent<Camera>();camera.tag="MainCamera";
+        camera.transform.position=new Vector3(7.5f,0,-20);camera.orthographic=true;camera.orthographicSize=5;
+        camera.backgroundColor=new Color(0.97f,0.9f,0.85f);camera.clearFlags=CameraClearFlags.SolidColor;
+        var kinds=new[]{Ring2DShape.Straight,Ring2DShape.Gate,Ring2DShape.Seven,Ring2DShape.ZShape};
+        for(int i=0;i<kinds.Length;i++)
+        {
+            var ring=Add(kinds[i].ToString(),new Vector2(i*5,0),kinds[i],new Color(0.2f,0.65f,1));
+            ring.Connections=new Ring2DConnection[0];ring.Rebuild();
+            if(kinds[i]==Ring2DShape.Gate)ProceduralRing2DEditor.CreateGateClasps(ring);else ProceduralRing2DEditor.CreateClasp(ring);
+        }
+        EditorSceneManager.SaveScene(scene,ClaspScenePath);AssetDatabase.SaveAssets();
+    }
+    /// <summary>保留原 A/B 切片，追加 C 卡扣切片；以后可替换为独立的 C Sprite。</summary>
+    public static Sprite GetClaspSprite()
+    {
+        var sprite=AssetDatabase.LoadAllAssetsAtPath(TexturePath).OfType<Sprite>().FirstOrDefault(s=>s.name=="RingClasp_C");
+        if(sprite!=null)return sprite;
+        var importer=AssetImporter.GetAtPath(TexturePath) as TextureImporter;
+        if(importer==null)throw new InvalidOperationException("找不到卡扣示例图："+TexturePath);
+        var factories=new SpriteDataProviderFactories();factories.Init();
+        var provider=factories.GetSpriteEditorDataProviderFromObject(importer);provider.InitSpriteEditorDataProvider();
+        var slices=provider.GetSpriteRects().ToList();
+        var added=new SpriteRect{name="RingClasp_C",rect=new Rect(784,13,88,102),alignment=SpriteAlignment.Custom,pivot=new Vector2(0.5f,0.5f),border=new Vector4(8,8,8,8),spriteID=GUID.Generate()};
+        slices.RemoveAll(s=>s.name==added.name);slices.Add(added);provider.SetSpriteRects(slices.ToArray());
+        var names=provider.GetDataProvider<ISpriteNameFileIdDataProvider>();
+        var pairs=names.GetNameFileIdPairs().Where(p=>p.name!=added.name).ToList();pairs.Add(new SpriteNameFileIdPair(added.name,added.spriteID));
+        names.SetNameFileIdPairs(pairs);provider.Apply();
+        importer.SaveAndReimport();
+        return AssetDatabase.LoadAllAssetsAtPath(TexturePath).OfType<Sprite>().First(s=>s.name=="RingClasp_C");
+    }
     public static void AssignSprites(ProceduralRing2D ring)
     {
         var all = AssetDatabase.LoadAllAssetsAtPath(TexturePath).OfType<Sprite>().ToArray();
@@ -168,7 +290,7 @@ public static class Ring2DDemoEditor
             importer.SaveAndReimport(); all = AssetDatabase.LoadAllAssetsAtPath(TexturePath).OfType<Sprite>().ToArray();
         }
         ring.BodySprite = all.First(s => s.name == "RingBody_A"); ring.ConnectionSprite = all.First(s => s.name == "RingConnector_B");
-        const string materialPath = "Assets/RotateRings/Materials/Ring2D.mat";
+        const string materialPath = "Assets/RotateRings/Ring2D/Materials/Ring2D.mat";
         var material = AssetDatabase.LoadAssetAtPath<Material>(materialPath);
         if (material == null) { material = new Material(Shader.Find("RotateRings/Ring 2D")); AssetDatabase.CreateAsset(material, materialPath); }
         ring.RenderMaterial = material;

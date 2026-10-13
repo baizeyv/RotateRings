@@ -164,10 +164,31 @@ TextureImporter:
       indices: 
       edges: []
       weights: []
+    - serializedVersion: 2
+      name: RingClasp_C
+      rect:
+        serializedVersion: 2
+        x: 784
+        y: 13
+        width: 88
+        height: 102
+      alignment: 9
+      pivot: {x: 0.5, y: 0.5}
+      border: {x: 8, y: 8, z: 8, w: 8}
+      outline: []
+      physicsShape: []
+      tessellationDetail: 0
+      bones: []
+      spriteID: 217ba32a693bbd045915ca0deb43c97a
+      internalID: 238887995
+      vertices: []
+      indices: 
+      edges: []
+      weights: []
     outline: []
     physicsShape: []
     bones: []
-    spriteID: 
+    spriteID: db3bb9f533e72714cb5419e6c7e2345d
     internalID: 0
     vertices: []
     indices: 
@@ -176,6 +197,7 @@ TextureImporter:
     secondaryTextures: []
     nameFileIdTable:
       RingBody_A: -2849317105815717448
+      RingClasp_C: 238887995
       RingConnector_B: 4566341277228160027
   mipmapLimitGroupName: 
   pSDRemoveMatte: 0

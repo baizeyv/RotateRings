@@ -28,6 +28,8 @@ namespace RotateRings
         public bool AllowDrag = true;
         [Tooltip("直线、门形、7 形、Z 形的世界坐标移动轴。")]
         public Ring2DMovementAxis MovementAxis = Ring2DMovementAxis.Horizontal;
+        [Tooltip("固定在场景中的 C 图卡扣。配置后由卡扣通道决定移动方向；多个卡扣须平行。")]
+        public Ring2DClasp[] Clasps = new Ring2DClasp[0];
         [InspectorName("Collision Mode")] public Ring2DPhysicsMode PhysicsMode = Ring2DPhysicsMode.BlockRotation;
         public bool LockRotation;
         [Range(8, 128), Tooltip("碰撞圆周分段，与显示 Segments 独立；C 环按覆盖角缩减，门字环仅细分圆角。")]
@@ -58,6 +60,7 @@ namespace RotateRings
         private readonly List<Ring2DCollisionShape> localShapes = new List<Ring2DCollisionShape>();
         private readonly List<Ring2DCollisionShape> worldShapes = new List<Ring2DCollisionShape>();
         private readonly List<ProceduralRing2D> obstacles = new List<ProceduralRing2D>();
+        private readonly List<Ring2DCollisionShape> claspFrames = new List<Ring2DCollisionShape>();
 
         public IReadOnlyList<Ring2DConnectionView> ConnectionViews { get { return views; } }
         public Mesh SavedMesh { get { return savedMesh; } }
@@ -66,7 +69,22 @@ namespace RotateRings
         public bool DragsByMovement { get { return Settings.Shape == Ring2DShape.Straight || Settings.Shape == Ring2DShape.Gate ||
             Settings.Shape == Ring2DShape.Seven || Settings.Shape == Ring2DShape.ZShape; } }
         private bool SharesMovementAxis(ProceduralRing2D other)
-        { return DragsByMovement && other.DragsByMovement && MovementAxis == other.MovementAxis; }
+        { Vector2 a, b; return DragsByMovement && other.DragsByMovement && TryMovementDirection(out a) && other.TryMovementDirection(out b) && Mathf.Abs(Vector2.Dot(a,b)) > 0.9999f; }
+
+        /// <summary>使用固定卡扣的世界通道方向；未配置卡扣时保留旧移动轴，非平行卡扣拒绝移动。</summary>
+        public bool TryMovementDirection(out Vector2 direction)
+        {
+            direction = MovementAxis == Ring2DMovementAxis.Horizontal ? Vector2.right : Vector2.up;
+            bool found = false;
+            if (Clasps != null) foreach (var clasp in Clasps)
+            {
+                if (clasp == null || !clasp.isActiveAndEnabled) continue;
+                if (!clasp.Valid || clasp.Direction.sqrMagnitude < 0.99f) return false;
+                if (!found) { direction = clasp.Direction; found = true; }
+                else if (Mathf.Abs(Vector2.Dot(direction, clasp.Direction)) < 0.9999f) return false;
+            }
+            return true;
+        }
         /// <summary>只在形状和 A 图 UV 仍匹配时复用资源，避免显示旧形状而碰撞体已变成新形状。</summary>
         public bool UsesSavedMesh
         {
@@ -132,7 +150,11 @@ namespace RotateRings
             if (float.IsNaN(displacement.x) || float.IsInfinity(displacement.x) ||
                 float.IsNaN(displacement.y) || float.IsInfinity(displacement.y)) return;
             if (DragsByMovement)
-                displacement = MovementAxis == Ring2DMovementAxis.Horizontal ? new Vector2(displacement.x, 0) : new Vector2(0, displacement.y);
+            {
+                Vector2 direction;
+                if (!TryMovementDirection(out direction)) return;
+                displacement = direction * Vector2.Dot(displacement, direction);
+            }
             MoveGeometry(0, displacement);
         }
 
@@ -146,6 +168,9 @@ namespace RotateRings
             { transform.localRotation = rotation * Quaternion.Euler(0, 0, degrees); transform.position = position + displacement; return; }
             if (localShapes.Count == 0) return;
             obstacles.Clear();
+            claspFrames.Clear();
+            foreach (var clasp in Ring2DClasp.Active)
+                if (clasp != null && clasp.Valid) foreach (var frame in clasp.WorldFrames()) claspFrames.Add(frame);
             foreach (var ring in activeRings)
             {
                 if (ring == this || ring.PhysicsMode != Ring2DPhysicsMode.BlockRotation) continue;
@@ -194,6 +219,14 @@ namespace RotateRings
                     if (ring == blockedByContactOwner && distance < latchedClearance)
                     { latchedClearance = distance; latchedShape = i; latchedOtherShape = j; }
                     if (distance < clearance) { clearance = distance; closestRing = ring; closestShape = i; closestOtherShape = j; }
+                }
+                // 固定卡扣轨道也是几何障碍；不能套用 B 连接头的圆环通行豁免。
+                foreach (var a in worldShapes) foreach (var b in claspFrames)
+                {
+                    if (displacement == Vector3.zero && degrees != 0 && a.RotationInvariant) continue;
+                    if (Ring2DCollision.BoundsDistance(a,b) > Math.Max(0,clearance)) continue;
+                    double distance = Ring2DCollision.Clearance(a,b);
+                    if (distance < clearance) { clearance = distance; closestRing = null; }
                 }
                 if (clearance <= Ring2DCollision.ContactDistance && closestRing != null)
                 {
